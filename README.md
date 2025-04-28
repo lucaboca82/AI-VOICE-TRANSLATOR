@@ -18,9 +18,13 @@ AI Voice Translator is a Python-based application that converts audio input in E
 - **dotenv**: Environment variables management.
 - **uuid**: For generating unique file names for audio files.
 
-## Setup
+## Demo
 
-### Prerequisites
+You can try out the AI Voice Translator live on Hugging Face Spaces. Record your speech in English, and instantly receive translations in multiple languages. Experience it here:
+[Try the Demo](https://huggingface.co/spaces/aridepai17/aivoicetranslator)
+
+
+## Prerequisites
 
 - Python 3.7 or later
 - Install required Python packages:
