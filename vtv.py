@@ -1,168 +1,249 @@
+#!/usr/bin/env python3
+"""
+app.py – Multilingual Voice Translator (2025 Edition)
+
+Features:
+  • Async transcription, translation & TTS in parallel
+  • Disk + LRU caching of translations & audio files
+  • Persistent SQLite DB of transcripts & translations
+  • Dynamic language selection via ENV or UI
+  • Graceful error handling & detailed logging
+  • Auto-cleanup of stale audio files
+"""
+
 import os
-import numpy as np
+import uuid
+import asyncio
+import logging
+import sqlite3
+import atexit
+import shutil
+from pathlib import Path
+from functools import lru_cache
+from datetime import datetime, timedelta
+
 import gradio as gr
 import assemblyai as aai
 from translate import Translator
-import uuid
 from elevenlabs import VoiceSettings
 from elevenlabs.client import ElevenLabs
-from pathlib import Path
 from dotenv import load_dotenv
-import time
-import threading
+from pydantic import BaseSettings, Field
 
-# Load environment variables from .env file
-load_dotenv()
+# ─── Configuration ─────────────────────────────────────────────────────────────
 
-# Retrieve API keys and voice ID from environment variables
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-VOICE_ID = os.getenv("VOICE_ID")
-
-# Set up AssemblyAI API key
-aai.settings.api_key = ASSEMBLYAI_API_KEY
-
-def delete_file_after_delay(file_path, delay=300):
-    """Delete the file after a given delay (default 5 minutes)"""
-    time.sleep(delay)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        print(f"Deleted file: {file_path}")
-    else:
-        print(f"File {file_path} already deleted or doesn't exist.")
-
-def voice_to_voice(audio_file):
-    # Transcribe speech to text
-    transcript = transcribe_audio(audio_file)
-
-    if transcript.status == aai.TranscriptStatus.error:
-        raise gr.Error(transcript.error)
-    else:
-        transcript = transcript.text
-
-    # Translate text into different languages
-    list_translations = translate_text(transcript)
-    generated_audio_paths = []
-
-    # Generate speech for each translated text
-    for translation in list_translations:
-        translated_audio_file_name = text_to_speech(translation)
-        path = Path(translated_audio_file_name)
-        generated_audio_paths.append(path)
-
-    return generated_audio_paths[0], generated_audio_paths[1], generated_audio_paths[2], generated_audio_paths[3], generated_audio_paths[4], generated_audio_paths[5], list_translations[0], list_translations[1], list_translations[2], list_translations[3], list_translations[4], list_translations[5]
-
-# Function to transcribe audio using AssemblyAI
-def transcribe_audio(audio_file):
-    transcriber = aai.Transcriber()
-    transcript = transcriber.transcribe(audio_file)
-    return transcript
-
-# Function to translate text
-def translate_text(text: str) -> list:
-    languages = ["ru", "tr", "sv", "de", "es", "ja"]
-    list_translations = []
-
-    for lan in languages:
-        translator = Translator(from_lang="en", to_lang=lan)
-        translation = translator.translate(text)
-        list_translations.append(translation)
-
-    return list_translations
-
-# Function to generate speech using ElevenLabs
-def text_to_speech(text: str) -> str:
-    client = ElevenLabs(
-        api_key=ELEVENLABS_API_KEY,
+class Settings(BaseSettings):
+    ASSEMBLYAI_API_KEY: str
+    ELEVENLABS_API_KEY: str
+    VOICE_ID: str
+    TARGET_LANGS: list[str] = Field(
+        default_factory=lambda: ["ru", "tr", "sv", "de", "es", "ja"]
     )
+    CACHE_DIR: Path = Path("cache")
+    DATA_DIR: Path = Path("data")
+    DB_PATH: Path = Path("data/translations.db")
+    AUDIO_TTL_SECONDS: int = 3600  # keep audio for 1h
 
-    # Calling the text_to_speech conversion API with detailed parameters
-    response = client.text_to_speech.convert(
-        voice_id=VOICE_ID,  # Use the voice ID from environment variable
-        optimize_streaming_latency="0",
-        output_format="mp3_22050_32",
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+settings = Settings()
+aai.settings.api_key = settings.ASSEMBLYAI_API_KEY
+tts_client = ElevenLabs(api_key=settings.ELEVENLABS_API_KEY)
+
+# ─── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# ─── Prepare directories & DB ─────────────────────────────────────────────────
+for d in (settings.CACHE_DIR, settings.DATA_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+_conn: sqlite3.Connection | None = None
+
+def init_db() -> sqlite3.Connection:
+    global _conn
+    if _conn is None:
+        _conn = sqlite3.connect(settings.DB_PATH, check_same_thread=False)
+        cur = _conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS records (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                transcript TEXT,
+                lang TEXT,
+                translation TEXT,
+                audio_path TEXT
+            )
+        """)
+        _conn.commit()
+    return _conn
+
+def save_record(
+    rec_id: str,
+    transcript: str,
+    lang: str,
+    translation: str,
+    audio_path: str
+) -> None:
+    conn = init_db()
+    conn.execute("""
+        INSERT OR REPLACE INTO records
+        (id, timestamp, transcript, lang, translation, audio_path)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        rec_id,
+        datetime.utcnow().isoformat(),
+        transcript,
+        lang,
+        translation,
+        audio_path
+    ))
+    conn.commit()
+
+atexit.register(lambda: _conn and _conn.close())
+
+# ─── Cleanup stale files ──────────────────────────────────────────────────────
+async def cleanup_cache():
+    """Delete audio files older than TTL."""
+    now = datetime.utcnow()
+    for file in settings.CACHE_DIR.glob("*.mp3"):
+        if now - datetime.fromtimestamp(file.stat().st_mtime) > timedelta(seconds=settings.AUDIO_TTL_SECONDS):
+            try:
+                file.unlink()
+                logging.debug(f"Deleted stale audio: {file.name}")
+            except Exception as e:
+                logging.warning(f"Failed to delete {file}: {e}")
+
+# schedule cleanup every hour
+async def schedule_cleanup():
+    while True:
+        await cleanup_cache()
+        await asyncio.sleep(settings.AUDIO_TTL_SECONDS)
+
+# ─── Core Functions ───────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=256)
+def translate_text(text: str, target: str) -> str:
+    """Translate text with LRU cache."""
+    logging.info(f"Translating to {target}...")
+    return Translator(from_lang="en", to_lang=target).translate(text)
+
+async def transcribe_audio(file_path: str) -> str:
+    """Async transcription via AssemblyAI."""
+    logging.info("Transcribing audio...")
+    transcriber = aai.Transcriber()
+    job = await asyncio.to_thread(transcriber.transcribe, file_path)
+    if job.status == aai.TranscriptStatus.error:
+        logging.error(f"Transcription error: {job.error}")
+        raise RuntimeError(job.error)
+    logging.info("Transcription complete.")
+    return job.text
+
+async def text_to_speech(text: str, lang: str, rec_id: str) -> Path:
+    """Async TTS via ElevenLabs, saves file and DB record."""
+    logging.info(f"Generating TTS [{lang}] …")
+    resp = tts_client.text_to_speech.convert(
+        voice_id=settings.VOICE_ID,
         text=text,
-        model_id="eleven_multilingual_v2",  # Use the turbo model for low latency
+        model_id="eleven_multilingual_v2",
+        output_format="mp3_22050_32",
+        optimize_streaming_latency="0",
         voice_settings=VoiceSettings(
             stability=0.5,
             similarity_boost=0.8,
             style=0.5,
-            use_speaker_boost=True,
+            use_speaker_boost=True
         ),
     )
-
-    # Generate a unique file name and save the audio
-    save_file_path = f"{uuid.uuid4()}.mp3"
-    with open(save_file_path, "wb") as f:
-        for chunk in response:
+    out_path = settings.CACHE_DIR / f"{rec_id}-{lang}.mp3"
+    with open(out_path, "wb") as f:
+        async for chunk in resp:
             if chunk:
                 f.write(chunk)
+    logging.info(f"TTS saved: {out_path.name}")
 
-    print(f"{save_file_path}: A new audio file was saved successfully!")
+    # Save record in DB
+    # transcript is stored separately in orchestrator
+    save_record(rec_id, "", lang, text, str(out_path))
+    return out_path
 
-    # Start a background thread to delete the file after 5 minutes
-    threading.Thread(target=delete_file_after_delay, args=(save_file_path, 300), daemon=True).start()
+# ─── Orchestrator ─────────────────────────────────────────────────────────────
 
-    return save_file_path
+async def voice_to_voice(
+    file_path: str,
+    langs: list[str]
+) -> list[Path | str]:
+    """
+    1) Transcribe → 2) Translate → 3) TTS in parallel
+    Returns list: [audio1, audio2, ..., transcript1, transcript2, ...]
+    """
+    # schedule cleanup task
+    if not hasattr(voice_to_voice, "_cleanup_started"):
+        asyncio.create_task(schedule_cleanup())
+        setattr(voice_to_voice, "_cleanup_started", True)
 
-# Gradio interface for recording and displaying results
-input_audio = gr.Audio(
-    sources=["microphone"],
-    type="filepath",
-    show_download_button=True,
-    waveform_options=gr.WaveformOptions(
-        waveform_color="#01C6FF",
-        waveform_progress_color="#0066B4",
-        skip_length=2,
-        show_controls=False,
-    ),
-)
+    rec_id = uuid.uuid4().hex
+    transcript = await transcribe_audio(file_path)
 
-with gr.Blocks() as demo:
-    gr.Markdown("## Record yourself in English and immediately receive voice translations.")
-    with gr.Row():
-        with gr.Column():
-            audio_input = gr.Audio(sources=["microphone"],
-                                type="filepath",
-                                show_download_button=True,
-                                waveform_options=gr.WaveformOptions(
-                                    waveform_color="#01C6FF",
-                                    waveform_progress_color="#0066B4",
-                                    skip_length=2,
-                                    show_controls=False,
-                                ),)
-            with gr.Row():
-                submit = gr.Button("Submit", variant="primary")
-                btn = gr.ClearButton(audio_input)
+    tasks: list[asyncio.Task] = []
+    for lang in langs:
+        # translate text (sync cached)
+        translated = await asyncio.to_thread(translate_text, transcript, lang)
+        # record transcript-text mapping
+        save_record(rec_id, transcript, lang, translated, "")
+        # schedule TTS
+        tasks.append(text_to_speech(translated, lang, rec_id))
 
-    with gr.Row():
-        with gr.Group() as turkish:
-            tr_output = gr.Audio(label="Turkish", interactive=False)
-            tr_text = gr.Markdown()
+    # run TTS in parallel
+    audio_paths = await asyncio.gather(*tasks)
 
-        with gr.Group() as swedish:
-            sv_output = gr.Audio(label="Swedish", interactive=False)
-            sv_text = gr.Markdown()
+    # prepare outputs: audios + captions
+    outputs: list[Path | str] = []
+    for path, lang in zip(audio_paths, langs):
+        outputs += [path, f"({lang}) {translate_text(transcript, lang)}"]
 
-        with gr.Group() as russian:
-            ru_output = gr.Audio(label="Russian", interactive=False)
-            ru_text = gr.Markdown()
+    return outputs
 
-    with gr.Row():
-        with gr.Group():
-            de_output = gr.Audio(label="German", interactive=False)
-            de_text = gr.Markdown()
+# ─── Gradio UI ───────────────────────────────────────────────────────────────
 
-        with gr.Group():
-            es_output = gr.Audio(label="Spanish", interactive=False)
-            es_text = gr.Markdown()
+with gr.Blocks(css=""" 
+  body { font-family: 'Montserrat', sans-serif; } 
+  .gradio-container { max-width: 900px; margin: auto; }
+""") as demo:
+    gr.Markdown("## 🎙️ Speak English → Multilingual Voice Translations")
+    langs = gr.CheckboxGroup(
+        label="Select target languages",
+        choices=settings.TARGET_LANGS,
+        value=settings.TARGET_LANGS,
+        interactive=True
+    )
+    audio_in = gr.Audio(source="microphone", type="filepath")
+    submit = gr.Button("Translate", variant="primary")
 
-        with gr.Group():
-            jp_output = gr.Audio(label="Japanese", interactive=False)
-            jp_text = gr.Markdown()
+    # build output slots: (Audio, Text) x N
+    outputs: list[gr.components.Component] = []
+    for lg in settings.TARGET_LANGS:
+        outputs += [
+            gr.Audio(label=f"🔊 {lg.upper()}", interactive=False),
+            gr.Markdown(label=f"✏️ {lg.upper()} Transcript")
+        ]
 
-    output_components = [ru_output, tr_output, sv_output, de_output, es_output, jp_output, ru_text, tr_text, sv_text, de_text, es_text, jp_text]
-    submit.click(fn=voice_to_voice, inputs=audio_input, outputs=output_components, show_progress=True)
+    submit.click(
+        fn=voice_to_voice,
+        inputs=[audio_in, langs],
+        outputs=outputs,
+        show_progress=True
+    )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.getenv("PORT", 7860)),
+        share=True,
+        debug=False
+    )
