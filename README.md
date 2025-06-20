@@ -33,6 +33,9 @@ You can try out the AI Voice Translator live on Hugging Face Spaces. Record your
 pip install -r requirements.txt
 ```
 
+Co-authored-by: Bocaletto Luca <bocaletto-luca@users.noreply.github.com>
+
+
 ## LICENSE
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
 
